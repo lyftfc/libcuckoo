@@ -575,6 +575,61 @@ public:
   }
 
   /**
+   * Lossy upsert operation allowing the hash table to kick existing occupants
+   * out to user to make space for incoming KV pair. This allows the hash table
+   * to be used as a cache that relies on the Cuckoo algorithm itself to perform
+   * cache eviction.
+   * 
+   * While this function has similar parameters as the original @ref upsert
+   * function, the parameters @p fn and @p val are used differently:
+   * 
+   * In @ref upsert, @p val is used for insertion only when @p K is not found;
+   * otherwise, the user is to update the value through @p fn, which is called
+   * in all cases on the entry (found or inserted), just before the routine ends.
+   * 
+   * In this function, @p fn will be called on old values except for normal
+   * (non-kicking) insertion. When upsert_context indicates ALREADY_EXISTED, @p fn
+   * sees the old value of @p K which will be updated to @p val just after @p fn
+   * finishes; when indicates KICK_EXISTED, @p fn sees the value of the will-be-kicked
+   * entry, that is going to be replaced to (K,val) after @p fn finishes.
+   * 
+   * In the case that @p fn does not accept upsert_context, it is NOT called
+   * under normal insertion case. This makes particular sense when @p fn is used
+   * to implement garbage collection when the hash table works as a cache.
+   * 
+   * @return true if normally inserted, false if updated/kicked.
+   */
+  template <typename K, typename F, typename V>
+  bool lossy_upsert(K &&key, F fn, V &&val) {
+    hash_value hv = hashed_key(key);
+    auto b = snapshot_and_lock_two<normal_mode>(hv);
+    table_position pos = cuckoo_insert_loop<normal_mode>(hv, b, key, true);
+    UpsertContext upsert_context;
+    using CanInvokeWithUpsertContextT =
+        typename internal::CanInvokeWithUpsertContext<F, mapped_type>::type;
+    if (pos.status == ok) {
+      add_to_bucket(pos.index, pos.slot, hv.partial, std::forward<K>(key),
+                    std::forward<V>(val));
+      upsert_context = UpsertContext::NEWLY_INSERTED;
+      internal::InvokeUpraseFn(fn, buckets_[pos.index].mapped(pos.slot),
+                               upsert_context, CanInvokeWithUpsertContextT{});
+    } else if (pos.status == failure_lossy_kick) {
+      upsert_context = UpsertContext::KICK_EXISTED;
+      internal::InvokeUpraseFn(fn, buckets_[pos.index].mapped(pos.slot),
+                               upsert_context, CanInvokeWithUpsertContextT{});
+      del_from_bucket(pos.index, pos.slot);
+      add_to_bucket(pos.index, pos.slot, hv.partial, std::forward<K>(key),
+                    std::forward<V>(val));
+    } else {  // failure_key_duplicated
+      upsert_context = UpsertContext::ALREADY_EXISTED;
+      internal::InvokeUpraseFn(fn, buckets_[pos.index].mapped(pos.slot),
+                               upsert_context, CanInvokeWithUpsertContextT{});
+      buckets_[pos.index].mapped(pos.slot) = std::forward<V>(val);
+    }
+    return pos.status == ok;
+  }
+
+  /**
    * Equivalent to calling @ref uprase_fn with a functor that modifies the
    * given value and always returns false (meaning the element is not removed).
    * The passed-in functor must implement either <tt>bool
@@ -1128,6 +1183,7 @@ private:
     failure_key_duplicated,
     failure_table_full,
     failure_under_expansion,
+    failure_lossy_kick,
   };
 
   // A composite type for functions that need to return a table position, and
@@ -1190,7 +1246,7 @@ private:
    * load factor of the table is below the threshold
    */
   template <typename TABLE_MODE, typename K>
-  table_position cuckoo_insert_loop(hash_value hv, TwoBuckets &b, K &key) {
+  table_position cuckoo_insert_loop(hash_value hv, TwoBuckets &b, K &key, const bool lossy = false) {
     table_position pos;
     while (true) {
       const size_type hp = hashpower();
@@ -1198,6 +1254,7 @@ private:
       switch (pos.status) {
       case ok:
       case failure_key_duplicated:
+      case failure_lossy_kick:
         return pos;
       case failure_table_full:
         // Expand the table and try again, re-grabbing the locks
@@ -1234,7 +1291,7 @@ private:
   // failure_table_full -- Failed to find an empty slot for the table. Locks
   // are released. No meaningful position is returned.
   template <typename TABLE_MODE, typename K>
-  table_position cuckoo_insert(const hash_value hv, TwoBuckets &b, K &key) {
+  table_position cuckoo_insert(const hash_value hv, TwoBuckets &b, K &key, const bool lossy = false) {
     int res1, res2;
     bucket &b1 = buckets_[b.i1];
     if (!try_find_insert_bucket(b1, res1, hv.partial, key)) {
@@ -1282,10 +1339,17 @@ private:
       return table_position{insert_bucket, insert_slot, ok};
     }
     assert(st == failure);
-    LIBCUCKOO_DBG("hash table is full (hashpower = %zu, hash_items = %zu,"
-                  "load factor = %.2f), need to increase hashpower\n",
-                  hashpower(), size(), load_factor());
-    return table_position{0, 0, failure_table_full};
+    if (lossy) {
+      b = snapshot_and_lock_two<TABLE_MODE>(hv);
+      return table_position{
+        b.i1, static_cast<size_type>(hv.partial % slot_per_bucket()), failure_lossy_kick
+      };
+    } else {
+      LIBCUCKOO_DBG("hash table is full (hashpower = %zu, hash_items = %zu,"
+                    "load factor = %.2f), need to increase hashpower\n",
+                    hashpower(), size(), load_factor());
+      return table_position{0, 0, failure_table_full};
+    }
   }
 
   // add_to_bucket will insert the given key-value pair into the slot. The key

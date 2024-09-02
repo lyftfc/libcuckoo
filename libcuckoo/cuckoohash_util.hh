@@ -136,6 +136,7 @@ private:
 enum class UpsertContext {
   NEWLY_INSERTED,
   ALREADY_EXISTED,
+  KICK_EXISTED,
 };
 
 namespace internal {
@@ -174,7 +175,7 @@ bool InvokeUpraseFn(F& f, MappedType& mapped, UpsertContext context,
 template <typename F, typename MappedType>
 bool InvokeUpraseFn(F& f, MappedType& mapped, UpsertContext context,
                     std::false_type) {
-  if (context == UpsertContext::ALREADY_EXISTED) {
+  if (context != UpsertContext::NEWLY_INSERTED) {
     return f(mapped);
   } else {
     // Returning false indicates no deletion, making this a no-op.
