@@ -1250,7 +1250,7 @@ private:
     table_position pos;
     while (true) {
       const size_type hp = hashpower();
-      pos = cuckoo_insert<TABLE_MODE>(hv, b, key);
+      pos = cuckoo_insert<TABLE_MODE>(hv, b, key, lossy);
       switch (pos.status) {
       case ok:
       case failure_key_duplicated:
@@ -1876,7 +1876,7 @@ private:
       throw maximum_hashpower_exceeded(new_hp);
     }
     if (AUTO_RESIZE::value && load_factor() < minimum_load_factor()) {
-      throw load_factor_too_low(minimum_load_factor());
+      throw load_factor_too_low(load_factor());
     }
     if (hashpower() != orig_hp) {
       // Most likely another expansion ran before this one could grab the
